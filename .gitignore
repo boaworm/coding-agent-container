@@ -1,0 +1,24 @@
+# Agent state from running an agent inside this directory: conversation
+# history, crash logs, captured shell output. This is the stuff that must
+# never end up in a public repo.
+.crush/
+.codex/
+.claude/
+
+# Scratch space. AGENTS.md says use ./tmp, never /tmp.
+tmp/
+
+# Python virtualenvs these wrappers create (Linux build, host is macOS).
+.venv-linux/
+.venv/
+__pycache__/
+*.py[co]
+
+# Local secrets/overrides if you ever add any next to the scripts.
+.env
+.env.*
+*.local
+
+# Noise
+.DS_Store
+*.log

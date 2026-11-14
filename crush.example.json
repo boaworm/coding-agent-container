@@ -1,0 +1,26 @@
+{
+  "_comment": "Example of the host config these wrappers read: copy to ~/.config/crush/crush.json and edit. wrapCodex.sh/wrapCrush.sh only use providers whose type is openai-compat, and wrapCodex.sh asks each base_url's /models for what is actually being served, so 'models' is only a fallback for when a server is down. api_key may be a literal key or the name of an environment variable ('$VLLM_API_KEY' or '${VLLM_API_KEY}'), which keeps real keys out of this file.",
+  "options": {
+    "context_paths": []
+  },
+  "providers": {
+    "vllm": {
+      "type": "openai-compat",
+      "name": "vllm",
+      "base_url": "http://your-box.lan:8000/v1",
+      "api_key": "$VLLM_API_KEY",
+      "models": [
+        { "id": "your-local-model", "context_window": 262144 }
+      ]
+    },
+    "vllm-remote": {
+      "type": "openai-compat",
+      "name": "vllm-remote",
+      "base_url": "https://gpu.example.org/vllm/v1",
+      "api_key": "literal-key-if-you-must",
+      "models": [
+        { "id": "another-local-model", "context_window": 524288 }
+      ]
+    }
+  }
+}
