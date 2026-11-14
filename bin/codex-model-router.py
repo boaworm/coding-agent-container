@@ -15,20 +15,64 @@ import http.client
 import json
 import os
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DEFAULT_ROUTES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "routes.json")
 ROUTES_PATH = os.environ.get("CODEX_ROUTER_ROUTES", DEFAULT_ROUTES)
 TIMEOUT = float(os.environ.get("CODEX_ROUTER_TIMEOUT", "600"))
+ERROR_LOG = os.environ.get(
+    "CODEX_ROUTER_ERROR_LOG",
+    os.path.join(os.environ.get("CODEX_HOME", os.path.expanduser("~/.codex")),
+                 "model-router-error.json"))
+MAX_DUMP = 512 * 1024
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "content-length", "host",
 }
 
 
+LAST_GOOD_ROUTES = None
+
+
 def load_routes():
-    with open(ROUTES_PATH, "rb") as fh:
-        return json.load(fh)
+    """Read routes.json.
+
+    It lives on a mount shared with the host, where starting another session
+    rewrites it in place, so a read can land mid-write. Retry once and fall
+    back to the last complete read rather than taking the session down with it.
+    """
+    global LAST_GOOD_ROUTES
+    for attempt in (0, 1):
+        try:
+            with open(ROUTES_PATH, "rb") as fh:
+                routes = json.load(fh)
+        except (OSError, ValueError):
+            if attempt == 0:
+                time.sleep(0.25)
+                continue
+            if LAST_GOOD_ROUTES is not None:
+                return LAST_GOOD_ROUTES
+            raise
+        LAST_GOOD_ROUTES = routes
+        return routes
+
+
+def dump_error(method, tail, body, detail):
+    """Keep the last request an upstream refused, both halves of it.
+
+    A local model sometimes emits a half-written tool call, Codex echoes the
+    arguments back verbatim, and the upstream then reports the whole body as
+    unparsable JSON. Without this the only trace is a bare 400 in the log.
+    """
+    try:
+        with open(ERROR_LOG, "w", encoding="utf-8", errors="replace") as fh:
+            json.dump({"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                       "method": method, "path": tail,
+                       "upstream_error": detail[:MAX_DUMP].decode("utf-8", "replace"),
+                       "request": body[:MAX_DUMP].decode("utf-8", "replace")}, fh)
+    except OSError:
+        pass
 
 
 def split_base_url(base_url):
@@ -87,6 +131,27 @@ class Handler(BaseHTTPRequestHandler):
             return default, known[default]
         return None, None
 
+    def _translate_reasoning_effort(self, entry, body):
+        """Rewrite reasoning_effort per the route's reasoning_effort_map.
+
+        Some upstreams (e.g. vLLM serving Qwen) use "xhigh" where OpenAI
+        uses "high".  The map is keyed by the value Codex sends; the value is
+        what the upstream expects.  Non-JSON bodies or absent maps pass
+        through unchanged.
+        """
+        re_map = entry.get("reasoning_effort_map")
+        if not re_map or not body:
+            return body
+        try:
+            parsed = json.loads(body)
+        except (ValueError, TypeError):
+            return body
+        level = parsed.get("reasoning_effort")
+        if level and level in re_map:
+            parsed["reasoning_effort"] = re_map[level]
+            return json.dumps(parsed).encode()
+        return body
+
     # -- forwarding ------------------------------------------------------
     def forward(self, method, tail, entry, body):
         tls, host, port, prefix = split_base_url(entry["base_url"])
@@ -102,9 +167,16 @@ class Handler(BaseHTTPRequestHandler):
         if key:
             headers["Authorization"] = "Bearer " + key
         headers["accept-encoding"] = "identity"
+        body = self._translate_reasoning_effort(entry, body)
         try:
             conn.request(method, prefix + tail, body=body or None, headers=headers)
             resp = conn.getresponse()
+            detail = None
+            if resp.status >= 400:
+                detail = resp.read()
+                dump_error(method, tail, body, detail)
+                sys.stderr.write("router: upstream %d on %s; request kept in %s\n"
+                                 % (resp.status, tail, ERROR_LOG))
             self.send_response(resp.status, resp.reason)
             for k, v in resp.getheaders():
                 if k.lower() in HOP_BY_HOP:
@@ -113,12 +185,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("connection", "close")
             self.end_headers()
             self.close_connection = True
-            while True:
-                chunk = resp.read1(65536) if hasattr(resp, "read1") else resp.read(4096)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                self.wfile.flush()
+            if detail is not None:
+                self.wfile.write(detail)
+            else:
+                while True:
+                    chunk = resp.read1(65536) if hasattr(resp, "read1") else resp.read(4096)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            self.wfile.flush()
         except (OSError, http.client.HTTPException) as exc:
             detail = json.dumps({"error": {"message": "router: %s -> %s: %s" % (
                 entry["base_url"], type(exc).__name__, exc), "type": "router_error"}}).encode()

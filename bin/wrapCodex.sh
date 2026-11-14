@@ -22,6 +22,12 @@
 #   - Codex runs with approval policy "never" and sandbox mode
 #     danger-full-access: it does not ask before running commands and does not
 #     use its own inner sandbox. The container VM is the only boundary.
+#   - Codex's own config.toml under $STATE_DIR/home outranks the generated one
+#     and remembers the last /model pick, so that pick is read back, paired with
+#     the provider that serves it, and passed on the command line as
+#     -c model=/-c model_provider=. Otherwise a session starts on a model whose
+#     server it is not pointed at. Codex's thread-spawning tools are passed
+#     --disable multi_agent: the local models use them instead of doing the work.
 #   - That config, plus requirements.toml (which forbids web search), is
 #     generated on the host into $WRAPCODEX_STATE/etc and mounted read-only at
 #     /etc/codex, so Codex cannot change it.
@@ -39,7 +45,8 @@
 #   --shell    start bash in the sandbox instead of codex (args go to bash)
 #
 # Env overrides: WRAPCODEX_STATE, WRAPCODEX_PROVIDER, WRAPAGENT_IMAGE,
-#                WRAPAGENT_CPUS, WRAPAGENT_MEMORY, WRAPCLAUDE_GLOBAL
+#                WRAPAGENT_CPUS, WRAPAGENT_MEMORY, WRAPCLAUDE_GLOBAL,
+#                WRAPCODEX_ROUTER, WRAPCODEX_ROUTER_PORT, WRAPCODEX_MULTI_AGENT
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -63,6 +70,8 @@ ROUTER_PORT="${WRAPCODEX_ROUTER_PORT:-8777}"
 router_on=0
 router_routes='{}'   # model -> {base_url, env_key}, written to routes.json
 router_model=""      # the model this session starts on
+cfg_model=""         # passed as -c model= so a stale home config cannot pin
+cfg_provider=""      # passed as -c model_provider= (the two must agree)
 
 # shellcheck source=lockdown-common.sh
 source "$SCRIPT_DIR/lockdown-common.sh"
@@ -143,12 +152,57 @@ model_lines_filter() {
   done
 }
 
+# Probe a server's chat/completions endpoint to discover which reasoning_effort
+# values it actually accepts. Codex always sends the standard OpenAI names
+# (low/medium/high); some servers (e.g. vLLM on Qwen) rename "high" to "xhigh".
+# Returns a JSON map like {"high":"xhigh"} for the router to apply, or {} when
+# no translation is needed. The key is piped on stdin so it never appears in
+# curl's argv, matching the /models probe above. Only tests "high" — if the
+# server rejects it, vLLM's known alias "xhigh" is tried as a fallback.
+probe_reasoning_map() {
+  local url="$1" key="$2" model="$3"
+  local auth="Authorization: Bearer $key"
+  local body resp code
+
+  body=$(jq -cn --arg m "$model" --arg e "high" \
+    '{model: $m, messages: [{role: "user", content: ""}], reasoning_effort: $e, max_tokens: 1}')
+  resp=$(curl -s -m 3 -X POST "$url/chat/completions" \
+    -H @- -H "Content-Type: application/json" \
+    --data "$body" -w '\n%{http_code}' <<< "$auth" 2>/dev/null) || true
+  code="${resp##*$'\n'}"
+
+  [[ "$code" == 200 ]] && { printf '{}'; return 0; }
+  printf '%s' "$resp" | grep -qi "reasoning effort" 2>/dev/null \
+    || { printf '{}'; return 0; }
+
+  body=$(jq -cn --arg m "$model" --arg e "xhigh" \
+    '{model: $m, messages: [{role: "user", content: ""}], reasoning_effort: $e, max_tokens: 1}')
+  resp=$(curl -s -m 3 -X POST "$url/chat/completions" \
+    -H @- -H "Content-Type: application/json" \
+    --data "$body" -w '\n%{http_code}' <<< "$auth" 2>/dev/null) || true
+  code="${resp##*$'\n'}"
+
+  [[ "$code" == 200 ]] && printf '{"high":"xhigh"}' || printf '{}'
+}
+
+# What the user last chose with /model. Codex keeps it in its own config.toml
+# under $STATE_DIR/home, which is on the host and outlives every session. Only
+# that file's top level is read, so no provider's keys can be mistaken for it.
+remembered_model() {
+  local f="$STATE_DIR/home/.codex/config.toml" m=""
+  [[ -f $f ]] || return 1
+  m="$(sed -n '/^\[/q; s/^[[:space:]]*model[[:space:]]*=[[:space:]]*"\{0,1\}\([^"[:space:]]*\)"\{0,1\}[[:space:]]*$/\1/p' "$f" | head -1)"
+  [[ -n $m ]] || return 1
+  printf '%s\n' "$m"
+}
+
 # Writes $1/config.toml (all providers, $PROVIDER as the default) and
 # $1/requirements.toml, plus $1/models.json (what /model offers).
 write_codex_config() {
   local out="$1/config.toml" default=""
   local name url key var model ctx providers=""
   local catalog="[]" seen="" base_prompt="" catalog_path=""
+  local fb_name="" fb_model="" fb_ctx="" pick_name="" pick_model="" pick_ctx=""
   local -a served=()
   local line
   [[ -f "$CRUSH_CFG" ]] || die "$CRUSH_CFG not found; there are no local model providers to use."
@@ -161,6 +215,13 @@ write_codex_config() {
   if [[ $ROUTER_ENABLED != 0 && -n $base_prompt ]]; then
     router_on=1
   fi
+
+  # Codex writes its own model into $STATE_DIR/home/.codex/config.toml and that
+  # file outranks the generated one, so the last /model pick is honoured rather
+  # than fought -- and the provider has to follow it, or the session asks one
+  # server for another server's model. An explicit --provider still wins.
+  local want=""
+  [[ $provider_explicit -eq 1 ]] || want="$(remembered_model || true)"
 
   while IFS=$'\t' read -r name url key; do
     url="${url%/}"
@@ -185,24 +246,35 @@ write_codex_config() {
     fi
     ((${#served[@]})) || continue
 
+    # Probe reasoning level support: some servers (vLLM) use "xhigh" where
+    # OpenAI uses "high".  Record a translation map per server so the router
+    # can rewrite the value before forwarding (see probe_reasoning_map above).
+    local re_map='{}' probe_model=''
+    if [[ $router_on -eq 1 && ${#served[@]} -gt 0 ]]; then
+      IFS=$'\t' read -r probe_model _ <<< "${served[0]}"
+      re_map="$(probe_reasoning_map "$url" "$key" "$probe_model")"
+    fi
+
     var="CODEX_KEY_$(tr -c 'A-Za-z0-9\n' '_' <<< "$name" | tr '[:lower:]' '[:upper:]')"
     export "$var=$key"
     run_args+=(--env "$var")
 
     for line in ${served[@]+"${served[@]}"}; do
       IFS=$'\t' read -r model ctx <<< "$line"
-      if [[ -z $default && ( -z $PROVIDER || $PROVIDER == "$name" ) ]]; then
-        default="model_provider = $(toml_str "$name")
-model = $(toml_str "$model")
-${ctx:+model_context_window = $ctx}"
-        router_model="$model"
+      # The remembered pick may belong to a provider this loop only reaches
+      # later, so the provider's own first model is kept as the fallback.
+      if [[ -z $fb_model && ( -z $PROVIDER || $PROVIDER == "$name" ) ]]; then
+        fb_name="$name"; fb_model="$model"; fb_ctx="$ctx"
+      fi
+      if [[ -n $want && $model == "$want" && $pick_model != "$want" ]]; then
+        pick_name="$name"; pick_model="$model"; pick_ctx="$ctx"
       fi
       # Two servers can serve the same id; catalog slugs have to be unique.
       if [[ -n $base_prompt && $seen != *"|${model}|"* ]]; then
         seen+="|${model}|"
         router_routes="$(jq -cn --argjson routes "$router_routes" --arg slug "$model" \
-          --arg url "$url" --arg key "$var" \
-          '$routes + {($slug): {base_url: $url, env_key: $key}}')"
+          --arg url "$url" --arg key "$var" --argjson re_map "$re_map" \
+          '$routes + {($slug): ({base_url: $url, env_key: $key} + (if ($re_map | length) > 0 then {reasoning_effort_map: $re_map} else {} end))}')"
         local entry
         entry="$(catalog_entry "$model" "$name" "$url" "$ctx" \
           "$(jq 'length' <<< "$catalog")" "$base_prompt")" || return 1
@@ -225,6 +297,18 @@ wire_api = \"responses\"
   done < <(jq -r '.providers // {} | to_entries[]
                   | select(.value.type == "openai-compat")
                   | [.key, .value.base_url, (.value.api_key // "")] | @tsv' "$CRUSH_CFG")
+
+  if [[ -n $pick_model ]]; then
+    fb_name="$pick_name"; fb_model="$pick_model"; fb_ctx="$pick_ctx"
+  fi
+  if [[ -n $fb_model ]]; then
+    default="model_provider = $(toml_str "$fb_name")
+model = $(toml_str "$fb_model")
+${fb_ctx:+model_context_window = $fb_ctx}"
+    router_model="$fb_model"
+    cfg_model="$fb_model"
+    cfg_provider="$fb_name"
+  fi
 
   [[ -n $providers ]] || die "no usable openai-compat providers in $CRUSH_CFG."
   [[ -n $default ]] || die "provider '$PROVIDER' not found in $CRUSH_CFG."
@@ -268,6 +352,18 @@ EOF
 agent_setup() {
   mkdir -p "$STATE_DIR/home" "$STATE_DIR/etc" "$STATE_DIR/router"
   write_codex_config "$STATE_DIR/etc"
+  # What the session starts on is pinned on the command line, because Codex's
+  # own config.toml in $STATE_DIR/home outranks the generated one and would
+  # otherwise keep a model from one server paired with another server.
+  if [[ -n $cfg_model ]]; then
+    AGENT_ARGS+=(-c "model=$cfg_model" -c "model_provider=$cfg_provider")
+  fi
+  # The TUI hands every session its thread-spawning tools (create_thread and
+  # friends). The local models reach for them unprompted and then describe
+  # work they never did, so they are off unless explicitly asked for.
+  if [[ ${WRAPCODEX_MULTI_AGENT:-0} == 0 ]]; then
+    AGENT_ARGS+=(--disable multi_agent)
+  fi
   # The router runs as a child of tini's main process, so it is born and dies
   # with this container. Each VM has its own loopback, so concurrent sessions
   # can all use the same port. --shell does not start it.
@@ -300,9 +396,12 @@ agent_setup() {
 }
 
 PROVIDER="${WRAPCODEX_PROVIDER:-}"
+provider_explicit=0
+[[ -n $PROVIDER ]] && provider_explicit=1
 if [[ "${1:-}" == --provider ]]; then
   [[ $# -ge 2 ]] || die "--provider needs a name."
   PROVIDER="$2"
+  provider_explicit=1
   shift 2
 fi
 

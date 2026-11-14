@@ -140,7 +140,7 @@ tini's child, for wrappers that need a sidecar up before the agent starts.
   is baked into the image and authenticates off `GH_TOKEN` automatically. A
   missing token is a warning, not fatal. Opt out per tier: `WRAPCLAUDE_GITHUB=0`,
   `WRAPAGENT_GITHUB=0`.
-- **Codex config generation** (`write_codex_config` in `bin/wrapCodex.sh:148`)
+- **Codex config generation** (`write_codex_config` in `bin/wrapCodex.sh:168`)
   reads every `openai-compat` provider from `~/.config/crush/crush.json`, then
   live-probes each server's `/models` (3s curl, header piped via stdin so keys
   never appear in argv) to pick up the model actually being served, falling
@@ -150,8 +150,24 @@ tini's child, for wrappers that need a sidecar up before the agent starts.
   `sandbox_mode = "danger-full-access"` because the VM is the only boundary;
   `requirements.toml` (mounted read-only at `/etc/codex`) pins web search off
   and cannot be overridden from inside.
+- **Codex's own `config.toml` outranks the generated one**
+  (`remembered_model` in `bin/wrapCodex.sh:158`): `/model` and `/settings`
+  write `model` into `$STATE_DIR/home/.codex/config.toml`, which outlives every
+  session and beats `/etc/codex/config.toml`. Left alone, that pins a model
+  whose server the session is not pointed at. The wrapper reads that pick back
+  (top level of the file only), starts the session on it, pairs it with the
+  provider that serves it, and passes both as `-c model=`/`-c model_provider=`
+  so neither config file can disagree with the other. An explicit `--provider`
+  wins over the remembered model. `codex doctor` prints the resolved
+  model/provider pair, and `codex debug models` the resolved catalog -- both
+  work without a model round-trip.
+- **The TUI's agent-spawning tools are off by default** (`--disable
+  multi_agent`, `WRAPCODEX_MULTI_AGENT=1` to have them): Codex registers them
+  in every session as the `codex_tui` MCP namespace, the local models reach for
+  `create_thread` instead of doing the work, and then narrate results that
+  never arrived.
 - **Codex model catalog** (`codex_base_prompt` + `catalog_entry` in
-  `bin/wrapCodex.sh:84`) — `/model` lists exactly what
+  `bin/wrapCodex.sh:93`) — `/model` lists exactly what
   `model_catalog_json` contains, so the wrapper writes
   `$STATE_DIR/etc/models.json` (mounted at `/etc/codex/models.json`) with one
   entry per model the servers reported. Two Codex quirks make this fiddly:
@@ -169,14 +185,24 @@ tini's child, for wrappers that need a sidecar up before the agent starts.
   `http://127.0.0.1:8777/v1` and lets the router pick the upstream from the
   `model` in each request body. `$STATE_DIR/router` (mounted read-only at
   `/opt/codex-router`) holds the copied scripts plus `routes.json`, which maps
-  model -> `{base_url, env_key}`: keys stay in the `CODEX_KEY_<NAME>` env vars,
-  never in that file. launch.sh waits for `/health` before exec'ing Codex and
+  model -> `{base_url, env_key, reasoning_effort_map?}`: keys stay in the
+  `CODEX_KEY_<NAME>` env vars, never in that file. An optional
+  `reasoning_effort_map` (e.g. `{"high":"xhigh"}`) lets the router translate
+  non-standard reasoning-effort values—vLLM's Qwen models use "xhigh" where
+  OpenAI uses "high". The map is probed per server at launch via a trivial
+  `/chat/completions` request (see `probe_reasoning_map` in `wrapCodex.sh`). launch.sh waits for `/health` before exec'ing Codex and
   logs to `~/.codex/model-router.log`; the router is a child of the agent
   process, so it dies with the VM, and each VM has its own loopback so
   concurrent sessions can share the port. `--shell` starts no router (a codex
   launched by hand there cannot reach the providers), and `WRAPCODEX_ROUTER=0`
-  skips it entirely, putting the real server URLs back in the config.
-- **Codex `~/.codex/tmp` is a tmpfs** (`wrapCodex.sh:296`): Codex keeps its
+  skips it entirely, putting the real server URLs back in the config. An
+  upstream that refuses a request (a local model's half-written tool call gets
+  echoed back and the server then calls the whole body unparsable) leaves both
+  halves in `~/.codex/model-router-error.json`, named in the log line.
+  `routes.json` is rewritten in place on the shared mount when another session
+  starts, so the router retries a torn read and falls back to the last complete
+  one rather than failing the turn.
+- **Codex `~/.codex/tmp` is a tmpfs** (`wrapCodex.sh:350`): Codex keeps its
   setuid sandbox helper there and garbage-collects "stale" helpers; on the
   shared host mount, concurrent sessions delete each other's helpers because
   file locks don't cross VMs.
@@ -201,6 +227,11 @@ tini's child, for wrappers that need a sidecar up before the agent starts.
 
 ## Dockerfile gotchas
 
+- **The image is a snapshot that only `--rebuild` updates.** A tool the
+  Dockerfile installs that a session cannot find (`gh` was the one that got
+  everyone) means the image predates that layer, not that the layer is broken.
+  Everything after a changed layer is rebuilt too, so inserting one mid-file
+  costs the whole tail.
 - Ubuntu 26.04 ships **uutils (Rust) coreutils** by default; the image forcibly
   swaps to GNU coreutils (`--allow-remove-essential
   coreutils-from-gnu coreutils-from-uutils-`). Scripts may rely on GNU-only
@@ -234,6 +265,7 @@ tini's child, for wrappers that need a sidecar up before the agent starts.
 | `WRAPCLAUDE_AWS` / `WRAPCLAUDE_AWS_DURATION` | `1` / `43200` | wrapClaude only |
 | `WRAPCODEX_PROVIDER` | — (first provider) | wrapCodex |
 | `WRAPCODEX_ROUTER` / `WRAPCODEX_ROUTER_PORT` | `1` / `8777` | wrapCodex model router |
+| `WRAPCODEX_MULTI_AGENT` | `0` | wrapCodex (set `1` to keep Codex's thread-spawning tools) |
 | `WRAPCLAUDE_GITHUB` / `WRAPAGENT_GITHUB` | `1` | respective tiers (set `0` to skip GitHub token) |
 
 Note the shared-name quirk: the strict wrappers read the **global dir** from
