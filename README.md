@@ -15,54 +15,67 @@ your Mac.
 
 - **macOS** host with the Apple `container` CLI installed and its system
   daemon running (`container system start`).
-- A **persistent global volume** mounted at `/Volumes/ClaudeGlobal` (an
-  APFS volume, case-sensitive is recommended). This is where agent binaries
-  and shared tooling live. Override the path with `WRAPCLAUDE_GLOBAL`.
-- The agent CLIs installed once into `/global/npm`. See [Installing agents](#installing-agents).
+- A **persistent volume** mounted at `/Volumes/ClaudeGlobal` (an APFS
+  volume, case-sensitive is recommended). The toolkit and all agent state
+  live here; nothing is written to your home directory. Override the path
+  with `WRAPCLAUDE_GLOBAL`.
 - Optionally, `gh auth login` on the host (so GitHub access works in
   sandboxes) and `aws configure` / `aws sso login` on the host (for the
   Claude sandbox's AWS access).
 
-## The two sandbox tiers
+## How it is laid out
 
-| Tier | Wrappers | `/global` | Capabilities | AWS | `~/.config` | Use |
-|------|----------|-----------|--------------|-----|-------------|-----|
-| **Permissive** | `wrapClaude.sh` | read-write | full | STS session creds passed in | mounted read-only | General dev with full local tooling |
-| **Strict** | `wrapCodex.sh`, `wrapCrush.sh` | read-only | `--cap-drop ALL`, no AWS/SSH keys | none | not mounted | Untrusted/remote code |
+| What | Host | In the sandbox | Writable by a session |
+|------|------|----------------|-----------------------|
+| **Toolkit**: the three agents, Aider, shared tools | `/Volumes/ClaudeGlobal/toolkit` | `/global` | no, read-only |
+| Compilers, `gh`, system tooling | the image | `/usr/...` | no |
+| **Session state**: the agent's home and generated config | `/Volumes/ClaudeGlobal/state/<agent>/sessions/<id>` | `~/.claude`, `~/.codex`, ... | yes, and only by that session; removed at exit |
+| Seed (login, model picks) and shared history | `/Volumes/ClaudeGlobal/state/<agent>/{seed,shared}` | copied in / mounted | via the session |
+| **Working directory** | wherever you launched | same path | yes, the work and nothing else |
 
-The strict wrappers share `bin/lockdown-common.sh`, which handles flag parsing,
-image rebuilds, the capability drop, read-only mounts, and launch. A wrapper
-only sets a few variables (`AGENT`, `AGENT_PKG`, `AGENT_BIN`, `AGENT_ARGS`),
-defines `agent_setup`, and calls `lockdown_main`.
+Every session of every agent sees the same read-only toolkit and gets its
+own state directory, so you can run as many sessions as you like at once:
+several Claudes, several Crushes, any mix, on any repos. Package managers
+(`npm -g`, `cargo install`, `go install`) install to the VM's own disk and
+vanish with the session.
 
-## Installing agents
+Each launch uses the image built from the current `Dockerfile` (rebuilt
+automatically when the file changes) and whatever is in the toolkit.
 
-Each agent CLI is installed once into `/global/npm` and reused by every
-session. Only `--install` mounts `/global` read-write; every other mode
-mounts it read-only (strict tier) or read-write (Claude tier).
+Claude is handed more of the host than the other two: `~/.config` read-only,
+short-lived AWS credentials, and your `~/.claude` settings, hooks and skills.
+Codex and Crush run with `--cap-drop ALL` and get none of that.
+
+The wrappers share `bin/wrap-common.sh`, which handles flag parsing, the
+image, mounts, the session lifecycle and launch. A wrapper only sets a few
+variables (`AGENT`, `AGENT_PKG`, `AGENT_BIN`, `AGENT_ARGS`), defines
+`agent_setup`/`agent_finish`, and calls `wrap_main`.
+
+## The toolkit
+
+A launch installs its agent into the toolkit if it is not there yet. To
+upgrade one, or add shared tools, use the two modes that mount the toolkit
+read-write (and nothing else from the host):
 
 ```sh
-bin/wrapCrush.sh --install     # Crush into /global/npm
-bin/wrapCodex.sh --install     # Codex CLI into /global/npm
-# Claude is baked into the image, so no --install is needed.
+bin/wrapClaude.sh --install    # likewise wrapCodex.sh, wrapCrush.sh
+bin/wrapClaude.sh --toolkit    # bash with /global writable
+bin/install-aider.sh           # Aider + its own Python 3.12 into /global/aider
 ```
 
-Aider (needs Python ≤ 3.12; the image ships 3.14) is installed separately
-into `/global/aider` by `bin/install-aider.sh`, which launches a shell
-sandbox and fetches a standalone CPython 3.12:
-
-```sh
-bin/install-aider.sh
-```
+On the first launch after upgrading from the old layout, the tools at the top
+of the volume are moved into `toolkit/` and each agent's old
+`~/.<agent>-container` state is imported; those old directories can then be
+deleted.
 
 ## Usage
 
-### Claude Code (permissive tier)
+### Claude Code
 
 ```sh
 bin/wrapClaude.sh              # launch claude in the sandbox cwd
 bin/wrapClaude.sh --shell      # drop into bash in the sandbox instead
-bin/wrapClaude.sh --rebuild    # rebuild the image first, then launch
+bin/wrapClaude.sh --rebuild    # force an image rebuild first, then launch
 ```
 
 AWS credentials: short-lived STS session tokens are minted on the host via
@@ -73,7 +86,7 @@ GitHub: the host `GH_TOKEN` (or `gh auth token`) is passed as `GH_TOKEN` and
 git is configured through `GIT_CONFIG_*` env vars. Disable with
 `WRAPCLAUDE_GITHUB=0`.
 
-### Codex CLI (strict tier)
+### Codex CLI
 
 ```sh
 bin/wrapCodex.sh                          # use the first provider in crush.json
@@ -95,11 +108,11 @@ On every launch the wrapper:
 2. Live-probes each server's `/models` to discover the model actually being
    served (keys are piped via stdin so they never appear in argv).
 3. Writes `models.json`, `config.toml`, and `requirements.toml` into
-   `$WRAPCODEX_STATE/etc`, mounted read-only at `/etc/codex`.
+   the session's own `etc/`, mounted read-only at `/etc/codex`.
 4. Extracts Codex's shipped base prompt from the installed binary so each
    catalog entry can carry it (required by Codex) without overriding it.
 
-### Crush (strict tier)
+### Crush
 
 ```sh
 bin/wrapCrush.sh
@@ -107,9 +120,10 @@ bin/wrapCrush.sh --rebuild
 ```
 
 Crush reads `~/.config/crush/crush.json` (copied fresh and mounted read-only,
-with `AGENTS_container.md` appended to `options.context_paths`). Its data dir
-is seeded once from the host's model picks — delete
-`~/.crush-container/data/crush.json` to re-seed.
+with `AGENTS_container.md` appended to `options.context_paths`). Its
+per-project data (what would be `.crush/` in the repo) is kept on the volume
+instead; one Crush session per directory keeps its history, a second
+concurrent one in the same directory starts with a throwaway one.
 
 ## Configuration
 
@@ -129,10 +143,10 @@ vars (by name, never by value in argv).
 | Variable | Default | Used by |
 |---|---|---|
 | `WRAPCLAUDE_IMAGE` / `WRAPAGENT_IMAGE` | `claude-sandbox:latest` | image name |
-| `WRAPCLAUDE_STATE` | `~/.claude-container` | Claude state dir |
-| `WRAPCODEX_STATE` | `~/.codex-container` | Codex state dir |
-| `WRAPCRUSH_STATE` | `~/.crush-container` | Crush state dir |
-| `WRAPCLAUDE_GLOBAL` | `/Volumes/ClaudeGlobal` | shared global volume (all wrappers read this name) |
+| `WRAPCLAUDE_STATE` | `$WRAPCLAUDE_GLOBAL/state/claude` | Claude state dir |
+| `WRAPCODEX_STATE` | `$WRAPCLAUDE_GLOBAL/state/codex` | Codex state dir |
+| `WRAPCRUSH_STATE` | `$WRAPCLAUDE_GLOBAL/state/crush` | Crush state dir |
+| `WRAPCLAUDE_GLOBAL` | `/Volumes/ClaudeGlobal` | the volume (all wrappers read this name) |
 | `WRAPCLAUDE_CPUS` / `WRAPAGENT_CPUS` | `4` | CPU allocation |
 | `WRAPCLAUDE_MEMORY` / `WRAPAGENT_MEMORY` | `4G` | memory limit |
 | `WRAPCLAUDE_AWS` | `1` | AWS credential forwarding (Claude only) |
@@ -142,20 +156,21 @@ vars (by name, never by value in argv).
 | `WRAPCODEX_ROUTER_PORT` | `8777` | router listen port |
 | `WRAPCLAUDE_GITHUB` / `WRAPAGENT_GITHUB` | `1` | pass GitHub token to sandbox |
 
-> The strict wrappers read the global-dir path from `WRAPCLAUDE_GLOBAL` and
-> CPU/memory from `WRAPAGENT_*`, so overrides do not follow the per-agent
-> prefix consistently. This is intentional and kept simple.
+> Every wrapper reads the volume path from `WRAPCLAUDE_GLOBAL`; Codex and
+> Crush read image/CPU/memory from `WRAPAGENT_*`.
 
 ## Building the image
 
-All wrappers share one image. Rebuild it explicitly with:
+All wrappers share one image. It is rebuilt automatically by the next launch
+after the `Dockerfile` changes; force a rebuild (to pick up newer upstream
+releases) with:
 
 ```sh
 bin/wrapClaude.sh --rebuild
 ```
 
 The `Dockerfile` builds on `ubuntu:26.04` and installs GCC/G++ 15, LLVM/Clang
-22, Python 3.14, Node.js 22, Rust, Go, AWS CLI v2, gh, and Claude Code. It
+22, Python 3.14, Node.js 22, Rust, Go, AWS CLI v2 and gh (the agents are in the toolkit). It
 forcibly swaps Ubuntu's default uutils coreutils for GNU coreutils so
 scripts can rely on GNU flags. The build passes host `id -u`/`id -g` as
 `USER_UID`/`USER_GID` so files written into the mounted project keep host
@@ -166,14 +181,14 @@ ownership.
 ```
 Dockerfile                 # the sandbox image (ubuntu:26.04 + toolchains)
 bin/
-  wrapClaude.sh            # permissive launcher
-  wrapCodex.sh             # strict launcher + config/router generation
-  wrapCrush.sh             # strict launcher
-  lockdown-common.sh       # shared strict-tier logic (sourced)
+  wrap-common.sh           # shared launcher logic (sourced)
+  wrapClaude.sh            # Claude Code launcher
+  wrapCodex.sh             # Codex launcher + config/router generation
+  wrapCrush.sh             # Crush launcher
   github-common.sh         # shared GitHub credential injection (sourced)
   codex-model-router.py    # loopback proxy: model → upstream server
   codex-model-launch.sh    # starts the router, then execs codex
-  install-aider.sh         # installs Aider + Python 3.12 into /global
+  install-aider.sh         # installs Aider + Python 3.12 into the toolkit
 crush.example.json         # example crush.json to copy & edit
 AGENTS_container.md        # runtime system prompt injected into Codex/Crush VMs
 CLAUDE_container.md        # runtime system prompt injected into Claude VMs

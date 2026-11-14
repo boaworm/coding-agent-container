@@ -1,4 +1,4 @@
-# Sandbox image for running Claude Code under Apple's `container` runtime.
+# Sandbox image for running coding agents under Apple's `container` runtime.
 # Each container runs in its own lightweight Linux VM, so processes in here
 # cannot see or signal anything on the macOS host.
 FROM ubuntu:26.04
@@ -50,22 +50,17 @@ RUN GHVER="$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/c
  && rm -f /tmp/gh.tgz
 
 # Rust via rustup (the distro rustc lags behind). The toolchain lives in the
-# image; CARGO_HOME is pointed at /global at runtime (see ENV below) so the
-# registry cache and `cargo install` binaries persist between sessions.
+# image; CARGO_HOME is on the VM's own disk at runtime (see ENV below).
 ENV RUSTUP_HOME=/usr/local/rustup
 RUN curl -fsSL https://sh.rustup.rs \
       | CARGO_HOME=/usr/local/cargo sh -s -- -y --no-modify-path --profile minimal \
           --component rustfmt,clippy \
  && chmod -R a+rX /usr/local/rustup /usr/local/cargo
 
-# Go: latest official release (the distro package lags behind). GOPATH is
-# /global/go at runtime, so the module cache and `go install` binaries persist.
+# Go: latest official release (the distro package lags behind).
 RUN GOVER="$(curl -fsSL 'https://go.dev/VERSION?m=text' | head -1)" \
  && curl -fsSL "https://go.dev/dl/${GOVER}.linux-$(dpkg --print-architecture).tar.gz" \
       | tar -C /usr/local -xz
-
-RUN npm install -g @anthropic-ai/claude-code \
- && npm cache clean --force
 
 # Unprivileged user matching the host uid/gid so files written to the mounted
 # working directory keep sane ownership. gid 20 (staff on macOS) is "dialout"
@@ -73,16 +68,22 @@ RUN npm install -g @anthropic-ai/claude-code \
 RUN (getent group "${USER_GID}" >/dev/null || groupadd -g "${USER_GID}" "${USER_NAME}") \
  && useradd -m -u "${USER_UID}" -g "${USER_GID}" -s /bin/bash "${USER_NAME}"
 
-# Aider is not in the image: bin/install-aider.sh installs it, with its own
-# Python 3.12, into /global/aider and links it into /global/bin.
+# The agents (Claude Code, Codex, Crush) and Aider are not in the image: they
+# live in the toolkit, mounted read-only at /global, and are installed there
+# by the wrappers' --install and bin/install-aider.sh. Sessions cannot write
+# to /global, so package managers install to the VM's own disk (~/.local),
+# which is discarded at exit.
 USER ${USER_NAME}
 ENV HOME=/home/${USER_NAME} \
     CLAUDE_CONFIG_DIR=/home/${USER_NAME}/.claude \
     DISABLE_AUTOUPDATER=1 \
-    NPM_CONFIG_PREFIX=/global/npm \
-    CARGO_HOME=/global/cargo \
-    GOPATH=/global/go \
-    PATH=$PATH:/usr/lib/llvm/bin:/usr/local/cargo/bin:/usr/local/go/bin:/global/bin:/global/npm/bin:/global/cargo/bin:/global/go/bin
+    PYTHONDONTWRITEBYTECODE=1 \
+    NPM_CONFIG_PREFIX=/home/${USER_NAME}/.local/npm \
+    CARGO_HOME=/home/${USER_NAME}/.local/cargo \
+    GOPATH=/home/${USER_NAME}/.local/go \
+    PATH=$PATH:/usr/lib/llvm/bin:/usr/local/cargo/bin:/usr/local/go/bin:/global/bin:/global/npm/bin:/global/cargo/bin:/global/go/bin:/home/${USER_NAME}/.local/npm/bin:/home/${USER_NAME}/.local/cargo/bin:/home/${USER_NAME}/.local/go/bin
 
-# tini reaps zombies and forwards signals to claude.
-ENTRYPOINT ["/usr/bin/tini", "--", "claude"]
+# The wrappers always pass their own entrypoint (tini + the agent from
+# /global/npm/bin); this is only what a bare `container run` gets.
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["bash"]

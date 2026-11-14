@@ -14,15 +14,15 @@ Python 3.12 and is on PATH as `aider`.
   at the same absolute path as on the Mac, so paths match the host.
 - `~/.config` is the host's config dir, mounted read-only.
 - `~/.claude/hooks` and `~/.claude/skills` are read-only.
-- `/global` is a persistent, read-write directory shared by every sandbox
-  session across all projects (host: `/Volumes/ClaudeGlobal`, a case-sensitive
-  APFS volume).
-  Use it for tools and files that should outlive the session and be reused
-  elsewhere. Do not put project-specific secrets or data there.
+- `/global` is the shared toolkit (the agents themselves plus shared tools),
+  mounted READ-ONLY and identical in every sandbox session. You can run
+  what is there (it is on PATH) but cannot add to it or change it.
+- `~/.claude` is private to this session. Other sessions, including other
+  Claude sessions running right now, have their own.
 - The project directory is on the Mac's case-insensitive filesystem: `Foo`
-  and `foo` are the same file there. `/global` and `/tmp` are case-sensitive;
-  put anything that needs names differing only in case there.
-- Extracting archives with GNU `tar` directly into the project dir or `/global`
+  and `foo` are the same file there. `/tmp` is case-sensitive; put anything
+  that needs names differing only in case there.
+- Extracting archives with GNU `tar` directly into the project dir
   can fail with "Permission denied" on symlinks that point at `../` targets
   (tar's mode-000 placeholders can't be opened through the host share).
   Extract into `/tmp` first, then `cp -a` into place.
@@ -47,14 +47,14 @@ Python 3.12 and is on PATH as `aider`.
 ## Installing software
 - You run as an unprivileged user (`claude`) with no sudo. `apt-get install`
   and other system-wide installs will fail.
-- User-level tools persist if installed under `/global`, which is on PATH:
-  `npm install -g` goes to `/global/npm` automatically; standalone Linux
-  binaries or scripts go in `/global/bin`. Installs anywhere else in `~` are
-  lost at exit.
-- If a task needs a system tool or language runtime that is missing, stop and
-  ask the user to add it to the image: the Dockerfile is at
-  the `Dockerfile` at the top of the launcher repo on the host, and they
-  rebuild with `wrapClaude.sh --rebuild`. Name the exact packages needed.
+- `npm install -g`, `cargo install` and `go install` work and land on PATH,
+  but they go to this VM's own disk (`~/.local`) and are gone when the
+  session ends. Nothing you install is visible to other sessions.
+- If a tool should be available in every session, stop and ask the user to
+  add it: system packages and runtimes go in the `Dockerfile` at the top of
+  the launcher repo on the host (the next launch rebuilds the image
+  automatically), shared user-level tools go into the toolkit with
+  `wrapClaude.sh --toolkit`. Name the exact packages needed.
 - Project-local installs (into the project directory) persist, but they are
   Linux builds and the user may also work on the same project natively on macOS:
   - Python: use a `.venv-linux` virtualenv, never `.venv`. If you find an

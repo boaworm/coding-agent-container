@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install (or reinstall/upgrade) Aider into the persistent global dir.
+# Install (or reinstall/upgrade) Aider into the toolkit (/global).
 #
 # Aider needs Python <= 3.12 and the image ships 3.14, so this fetches a
 # standalone CPython 3.12 (astral-sh/python-build-standalone) into
@@ -8,10 +8,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(dirname "$SCRIPT_DIR")"
 
-cd "$REPO_DIR"
-WRAPCLAUDE_AWS=0 exec "$SCRIPT_DIR/wrapClaude.sh" --shell -s <<'EOF'
+# --toolkit is the mode that mounts the toolkit read-write (and nothing else).
+exec "$SCRIPT_DIR/wrapClaude.sh" --toolkit -s <<'EOF'
 set -euo pipefail
 dest=/global/aider
 arch="$(uname -m)"

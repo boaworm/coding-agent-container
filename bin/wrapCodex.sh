@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Launch OpenAI Codex CLI, locked down, inside an Apple `container` VM,
 # talking only to the self-hosted models configured for Crush.
-# See lockdown-common.sh for exactly what the sandbox can and cannot reach.
+# See wrap-common.sh for the layout every wrapper shares: read-only toolkit
+# at /global, one private state dir per session, nothing written to $HOME.
 #
 #   - Model providers come from ~/.config/crush/crush.json (every
 #     openai-compat provider). Each launch asks each server what model it is
 #     serving right now, since crush.json drifts. Providers keep their Crush
 #     names; the first is used unless `--provider <name>` (or
 #     WRAPCODEX_PROVIDER) picks another.
-#   - $STATE_DIR/etc/models.json is generated from what those servers report
+#   - $SESSION_DIR/etc/models.json is generated from what those servers report
 #     and pointed at with model_catalog_json, so /model lists exactly these
 #     models instead of the OpenAI ones Codex ships. Each catalog entry must
 #     repeat Codex's own base prompt (see codex_base_prompt); if it cannot be
@@ -22,26 +23,29 @@
 #   - Codex runs with approval policy "never" and sandbox mode
 #     danger-full-access: it does not ask before running commands and does not
 #     use its own inner sandbox. The container VM is the only boundary.
-#   - Codex's own config.toml under $STATE_DIR/home outranks the generated one
-#     and remembers the last /model pick, so that pick is read back, paired with
+#   - Codex's own config.toml (in the session's home, saved to the seed when
+#     the session ends) outranks the generated one and remembers the last
+#     /model pick, so that pick is read back from the seed, paired with
 #     the provider that serves it, and passed on the command line as
 #     -c model=/-c model_provider=. Otherwise a session starts on a model whose
 #     server it is not pointed at. Codex's thread-spawning tools are passed
 #     --disable multi_agent: the local models use them instead of doing the work.
 #   - That config, plus requirements.toml (which forbids web search), is
-#     generated on the host into $WRAPCODEX_STATE/etc and mounted read-only at
-#     /etc/codex, so Codex cannot change it.
+#     generated on the host into this session's own etc/ and mounted read-only
+#     at /etc/codex, so Codex cannot change it and no other launch rewrites it.
 #   - API keys are passed as env vars by name, never in argv.
-#   - Codex state (sessions, its own config.toml) lives on the host in
-#     $WRAPCODEX_STATE/home (default ~/.codex-container), never in ~/.codex.
+#   - Codex's home is per session: config.toml and auth.json are copied from
+#     the seed and saved back when the session ends. Rollouts (sessions/) are
+#     shared, one file per session, so `codex resume` works everywhere.
 #   - AGENTS.md is regenerated each launch from ~/.claude/CLAUDE.md plus
 #     AGENTS_container.md (edits made inside are overwritten next launch).
 #
-# Usage: wrapCodex.sh [--provider NAME] [--rebuild] [--install] [--shell]
-#                     [codex args...]
+# Usage: wrapCodex.sh [--provider NAME] [--rebuild] [--install] [--toolkit]
+#                     [--shell] [codex args...]
 #   --provider use this Crush provider (e.g. vllm, vllm-remote)
-#   --rebuild  rebuild the image first
-#   --install  install/upgrade Codex into /global/npm (only mode with /global rw)
+#   --rebuild  rebuild the image first (automatic when the Dockerfile changed)
+#   --install  install/upgrade Codex in the toolkit
+#   --toolkit  bash with the toolkit mounted read-write and nothing else
 #   --shell    start bash in the sandbox instead of codex (args go to bash)
 #
 # Env overrides: WRAPCODEX_STATE, WRAPCODEX_PROVIDER, WRAPAGENT_IMAGE,
@@ -57,7 +61,7 @@ AGENT_PKG=@openai/codex
 AGENT_BIN=codex
 # Inline TUI: no alternate screen, so terminal scrollback and copy/paste work.
 AGENT_ARGS=(--no-alt-screen)
-STATE_DIR="${WRAPCODEX_STATE:-$HOME/.codex-container}"
+AGENT_STATE="${WRAPCODEX_STATE:-}"
 CRUSH_CFG="$HOME/.config/crush/crush.json"
 # /model changes the model but never the provider a session is bound to, so
 # every provider is pointed at codex-model-router.py, a loopback proxy that
@@ -73,8 +77,8 @@ router_model=""      # the model this session starts on
 cfg_model=""         # passed as -c model= so a stale home config cannot pin
 cfg_provider=""      # passed as -c model_provider= (the two must agree)
 
-# shellcheck source=lockdown-common.sh
-source "$SCRIPT_DIR/lockdown-common.sh"
+# shellcheck source=wrap-common.sh
+source "$SCRIPT_DIR/wrap-common.sh"
 
 toml_str() { jq -Rn --arg s "$1" '$s'; }
 
@@ -92,9 +96,9 @@ CODEX_PROMPT_END='ensure you call `update_plan` to mark all steps as `completed`
 # its own model list.
 codex_base_prompt() {
   local bin cache
-  bin="$(ls -1 "$GLOBAL_DIR"/npm/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex 2>/dev/null | head -1)" || return 1
+  bin="$(ls -1 "$TOOLKIT_DIR"/npm/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex 2>/dev/null | head -1)" || return 1
   [[ -n $bin ]] || return 1
-  cache="$STATE_DIR/base_instructions.md"
+  cache="$AGENT_STATE/base_instructions.md"
   if [[ ! -s $cache || $cache -ot "$bin" ]]; then
     perl -e '
       local $/;
@@ -105,10 +109,10 @@ codex_base_prompt() {
       die "base prompt not found in $ARGV[0]\n" if $start < 0 || $end < 0;
       binmode(STDOUT, ":raw");
       print substr($data, $start, $end - $start + length($ARGV[2]));
-    ' "$bin" "$CODEX_PROMPT_START" "$CODEX_PROMPT_END" > "$cache.tmp" \
-      || { rm -f "$cache.tmp"; return 1; }
-    [[ -s $cache.tmp ]] || { rm -f "$cache.tmp"; return 1; }
-    mv "$cache.tmp" "$cache"
+    ' "$bin" "$CODEX_PROMPT_START" "$CODEX_PROMPT_END" > "$cache.tmp.$$" \
+      || { rm -f "$cache.tmp.$$"; return 1; }
+    [[ -s $cache.tmp.$$ ]] || { rm -f "$cache.tmp.$$"; return 1; }
+    mv "$cache.tmp.$$" "$cache"
   fi
   cat "$cache"
 }
@@ -185,11 +189,11 @@ probe_reasoning_map() {
   [[ "$code" == 200 ]] && printf '{"high":"xhigh"}' || printf '{}'
 }
 
-# What the user last chose with /model. Codex keeps it in its own config.toml
-# under $STATE_DIR/home, which is on the host and outlives every session. Only
+# What the user last chose with /model. Codex keeps it in its own config.toml,
+# which is saved to the seed when a session ends and so outlives it. Only
 # that file's top level is read, so no provider's keys can be mistaken for it.
 remembered_model() {
-  local f="$STATE_DIR/home/.codex/config.toml" m=""
+  local f="$SEED_DIR/config.toml" m=""
   [[ -f $f ]] || return 1
   m="$(sed -n '/^\[/q; s/^[[:space:]]*model[[:space:]]*=[[:space:]]*"\{0,1\}\([^"[:space:]]*\)"\{0,1\}[[:space:]]*$/\1/p' "$f" | head -1)"
   [[ -n $m ]] || return 1
@@ -216,7 +220,7 @@ write_codex_config() {
     router_on=1
   fi
 
-  # Codex writes its own model into $STATE_DIR/home/.codex/config.toml and that
+  # Codex writes its own model into its home config.toml and that
   # file outranks the generated one, so the last /model pick is honoured rather
   # than fought -- and the provider has to follow it, or the session asks one
   # server for another server's model. An explicit --provider still wins.
@@ -350,11 +354,29 @@ EOF
 }
 
 agent_setup() {
-  mkdir -p "$STATE_DIR/home" "$STATE_DIR/etc" "$STATE_DIR/router"
-  write_codex_config "$STATE_DIR/etc"
+  local home="$SESSION_DIR/home" etc="$SESSION_DIR/etc" router="$SESSION_DIR/router"
+  local legacy="$HOME/.codex-container/home" f
+  mkdir -p "$home" "$etc" "$router" "$SHARED_DIR/sessions"
+
+  # State used to live in ~/.codex-container; bring it over once. The old
+  # directory is left alone.
+  if [[ ! -e $SEED_DIR/.imported && -d $legacy ]]; then
+    echo "wrapCodex: importing state from $legacy (it can be deleted afterwards)." >&2
+    for f in config.toml auth.json; do
+      if [[ -f $legacy/$f ]]; then cp -p "$legacy/$f" "$SEED_DIR/$f"; fi
+    done
+    if [[ -d $legacy/sessions ]]; then
+      cp -Rp "$legacy/sessions/." "$SHARED_DIR/sessions/"
+    fi
+  fi
+  : > "$SEED_DIR/.imported"
+  seed_load config.toml "$home"
+  seed_load auth.json "$home"
+
+  write_codex_config "$etc"
   # What the session starts on is pinned on the command line, because Codex's
-  # own config.toml in $STATE_DIR/home outranks the generated one and would
-  # otherwise keep a model from one server paired with another server.
+  # own config.toml outranks the generated one and would otherwise keep a
+  # model from one server paired with another server.
   if [[ -n $cfg_model ]]; then
     AGENT_ARGS+=(-c "model=$cfg_model" -c "model_provider=$cfg_provider")
   fi
@@ -366,33 +388,35 @@ agent_setup() {
   fi
   # The router runs as a child of tini's main process, so it is born and dies
   # with this container. Each VM has its own loopback, so concurrent sessions
-  # can all use the same port. --shell does not start it.
+  # can all use the same port, and each has its own routes.json. --shell does
+  # not start it.
   if [[ $router_on -eq 1 && $(jq 'length' <<< "$router_routes") -gt 0 ]]; then
-    cp "$SCRIPT_DIR/codex-model-router.py" "$SCRIPT_DIR/codex-model-launch.sh" \
-      "$STATE_DIR/router/"
+    cp "$SCRIPT_DIR/codex-model-router.py" "$SCRIPT_DIR/codex-model-launch.sh" "$router/"
     jq -n --argjson routes "$router_routes" --arg port "$ROUTER_PORT" \
       --arg default "$router_model" \
       '{port: ($port | tonumber), default: $default, routes: $routes}' \
-      > "$STATE_DIR/router/routes.json"
+      > "$router/routes.json"
     run_args+=(
-      --volume "$STATE_DIR/router:/opt/codex-router:ro"
+      --volume "$router:/opt/codex-router:ro"
       --env "CODEX_ROUTER_PORT=$ROUTER_PORT"
     )
     AGENT_LAUNCHER=(/bin/bash /opt/codex-router/codex-model-launch.sh)
-  else
-    rm -f "$STATE_DIR/router/routes.json"
   fi
-  # Overwritten every launch, so edits Codex makes to it do not stick.
-  write_instructions "$STATE_DIR/home/AGENTS.md"
+  write_instructions "$home/AGENTS.md"
   run_args+=(
-    --volume "$STATE_DIR/home:$CHOME/.codex"
-    # Per-run scratch: Codex keeps its sandbox helper in ~/.codex/tmp and
-    # cleans up helpers it thinks are stale. File locks do not cross VMs, so
-    # on the shared mount one session deletes another's helper.
+    --volume "$home:$CHOME/.codex"
+    --volume "$SHARED_DIR/sessions:$CHOME/.codex/sessions"
+    # Codex keeps its setuid sandbox helper in ~/.codex/tmp; keep that on the
+    # VM's own disk rather than the host share.
     --tmpfs "$CHOME/.codex/tmp"
-    --mount "type=bind,source=$STATE_DIR/etc,target=/etc/codex,readonly"
+    --mount "type=bind,source=$etc,target=/etc/codex,readonly"
     --env CODEX_HOME="$CHOME/.codex"
   )
+}
+
+agent_finish() {
+  seed_save "$1/home/config.toml"
+  seed_save "$1/home/auth.json"
 }
 
 PROVIDER="${WRAPCODEX_PROVIDER:-}"
@@ -405,4 +429,4 @@ if [[ "${1:-}" == --provider ]]; then
   shift 2
 fi
 
-lockdown_main "$@"
+wrap_main "$@"

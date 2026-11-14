@@ -15,7 +15,7 @@
 #   - Commits are unsigned; there are no GPG keys in the container.
 #
 # The caller sets GITHUB_ENABLED=0 to skip (WRAPCLAUDE_GITHUB in
-# wrapClaude.sh, WRAPAGENT_GITHUB in the lockdown wrappers). A missing token
+# wrapClaude.sh, WRAPAGENT_GITHUB in wrapCodex.sh and wrapCrush.sh). A missing token
 # is a warning, not a fatal error: the sandbox still starts, git just cannot
 # reach GitHub.
 

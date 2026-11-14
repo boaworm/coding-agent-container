@@ -13,6 +13,8 @@ Rust (rustup, stable), Go (latest), gh.
   at the same absolute path as on the Mac.
 - `/global` is a shared tool directory, mounted READ-ONLY. You may run tools
   from it (they are on PATH) but cannot change it.
+- Your own state directory is private to this session; other sessions,
+  including ones running the same agent right now, have their own.
 - Nothing else from the host is visible: no `~/.config`, no `~/.ssh`, no
   `~/.aws`, no credentials other than your own provider login and, if
   GitHub access was granted, the `GH_TOKEN` environment variable.
